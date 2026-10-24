@@ -12,7 +12,7 @@
 //
 //	{"id":N,"op":"dial","net":"unix","addr":"/run/user/1000/x.sock"}   request
 //	{"id":N,"op":"dial","ok":true}                                     reply carrying at most one fd
-//	{"op":"exit","pid":123,"code":0}                                   unsolicited notification
+//	{"op":"exit","pid":123,"childID":1,"code":0}                                   unsolicited notification
 //
 // The caller assigns request IDs and replies echo them. The codec
 // decodes and encodes frames and descriptors. ID bookkeeping, read
@@ -54,10 +54,10 @@ import (
 const (
 	opDial   = "dial"   // request {net:"unix", addr}. reply {ok} + connected fd
 	opListen = "listen" // request {net:"unix"|"tcp", addr, unlink?, agent?}. reply {ok, path} + listener fd
-	opExec   = "exec"   // request {argv, env, dir?, ctty?, fds:0-3} + up to 3 SCM_RIGHTS stdio fds. reply {ok, pid}
-	opSignal = "signal" // request {pid, sig}. reply {ok}
+	opExec   = "exec"   // request {argv, env, dir?, ctty?, envfd?, fds:0-4} + SCM_RIGHTS fds. reply {ok, pid, childID}
+	opSignal = "signal" // request {pid, childID, sig}. reply {ok}
 	opPing   = "ping"   // request {}. reply {ok}
-	opExit   = "exit"   // unsolicited notification {pid, code}. no ID
+	opExit   = "exit"   // unsolicited notification {pid, childID, code}. no request ID
 	opFdAck  = "fdack"  // request {id of the reply whose descriptors were received}. no fds, no reply
 )
 
@@ -68,8 +68,9 @@ const (
 	rpcMaxLine = 256 << 10
 
 	// rpcMaxFds is the maximum number of SCM_RIGHTS descriptors any one
-	// frame may carry: exec passes child stdin, stdout and stderr.
-	rpcMaxFds = 3
+	// frame may carry. Exec passes child stdin, stdout and stderr plus
+	// the env-fd pipe declared by rpcFrame.EnvFd.
+	rpcMaxFds = 4
 
 	// rpcFdHerald is the one-byte payload of the message that carries a
 	// frame's descriptors. It is a NUL byte, which never appears inside
@@ -115,11 +116,21 @@ type rpcFrame struct {
 	Dir  string   `json:"dir,omitempty"`
 	Ctty bool     `json:"ctty,omitzero"`
 	Fds  int      `json:"fds,omitzero"`
+	// EnvFd, when set on an exec request, declares a fourth descriptor
+	// after stdin, stdout, and stderr: the --env-fd payload pipe for
+	// the forwarded client env pairs.
+	EnvFd bool `json:"envfd,omitzero"`
+
+	// Incubator requests identity-flag normalization for an incubator argv.
+	// The RPC caller is trusted to supply the executable and other arguments;
+	// this flag is not a privilege boundary against tailscaled.
+	Incubator bool `json:"incubator,omitzero"`
 
 	// signal request, exit notification, and exec reply.
-	Pid  int    `json:"pid,omitzero"`
-	Sig  string `json:"sig,omitempty"`
-	Code int    `json:"code,omitzero"` // exit notification only
+	Pid     int    `json:"pid,omitzero"`
+	ChildID int64  `json:"childID,omitzero"` // exec request ID; required for signals
+	Sig     string `json:"sig,omitempty"`
+	Code    int    `json:"code,omitzero"` // exit notification only
 
 	// Reply fields.
 	OK   bool   `json:"ok,omitzero"`
@@ -139,19 +150,18 @@ func rpcListenReq(id int64, network, addr string, unlink, agent bool) rpcFrame {
 	return rpcFrame{ID: id, Op: opListen, Net: network, Addr: addr, Unlink: unlink, Agent: agent}
 }
 
-func rpcExecReq(id int64, argv, env []string, dir string, ctty bool, nfds int) rpcFrame {
-	return rpcFrame{ID: id, Op: opExec, Argv: argv, Env: env, Dir: dir, Ctty: ctty, Fds: nfds}
+func rpcExecReq(id int64, argv, env []string, dir string, ctty, envFd bool, nfds int) rpcFrame {
+	return rpcFrame{ID: id, Op: opExec, Argv: argv, Env: env, Dir: dir, Ctty: ctty, EnvFd: envFd, Fds: nfds}
 }
 
-func rpcSignalReq(id int64, pid int, sig string) rpcFrame {
-	return rpcFrame{ID: id, Op: opSignal, Pid: pid, Sig: sig}
+func rpcSignalReq(id int64, child monitorProcess, sig string) rpcFrame {
+	return rpcFrame{ID: id, Op: opSignal, Pid: child.PID, ChildID: child.ID, Sig: sig}
 }
 
-// rpcExecReply is the reply to an exec request, OK plus the spawned
-// child's pid. The child's exit arrives later as an unsolicited exit
-// notification. The notification carries this pid.
+// rpcExecReply returns the PID and generation of the spawned child.
+// Signals and exit notifications carry the same pair.
 func rpcExecReply(id int64, pid int) rpcFrame {
-	return rpcFrame{ID: id, Op: opExec, OK: true, Pid: pid}
+	return rpcFrame{ID: id, Op: opExec, OK: true, Pid: pid, ChildID: id}
 }
 
 func rpcOKReply(id int64, op string) rpcFrame {
@@ -163,8 +173,8 @@ func rpcErrReply(id int64, op string, err error) rpcFrame {
 }
 
 // rpcExitNotify is the unsolicited child-exit notification frame.
-func rpcExitNotify(pid, code int) rpcFrame {
-	return rpcFrame{Op: opExit, Pid: pid, Code: code}
+func rpcExitNotify(child monitorProcess, code int) rpcFrame {
+	return rpcFrame{Op: opExit, Pid: child.PID, ChildID: child.ID, Code: code}
 }
 
 // rpcFdAckReq acknowledges receipt of the descriptors a reply with the
@@ -196,6 +206,9 @@ func (f rpcFrame) checkFds(n int) error {
 	}
 	if f.Op == opExec && f.Fds > 0 && f.Fds != n {
 		return fmt.Errorf("monitor rpc: exec declared %d fds but %d arrived", f.Fds, n)
+	}
+	if f.Op == opExec && f.EnvFd && n != 4 {
+		return fmt.Errorf("monitor rpc: envfd exec carried %d fds, want exactly 4 (stdio + env fd)", n)
 	}
 	return nil
 }
